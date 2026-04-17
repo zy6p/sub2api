@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/usagestats"
@@ -18,6 +19,9 @@ type userUsageRepoCapture struct {
 	service.UsageLogRepository
 	listParams  pagination.PaginationParams
 	listFilters usagestats.UsageLogFilters
+	statsUserID int64
+	statsStart  time.Time
+	statsEnd    time.Time
 }
 
 func (s *userUsageRepoCapture) ListWithFilters(ctx context.Context, params pagination.PaginationParams, filters usagestats.UsageLogFilters) ([]service.UsageLog, *pagination.PaginationResult, error) {
@@ -31,6 +35,13 @@ func (s *userUsageRepoCapture) ListWithFilters(ctx context.Context, params pagin
 	}, nil
 }
 
+func (s *userUsageRepoCapture) GetUserStatsAggregated(ctx context.Context, userID int64, startTime, endTime time.Time) (*usagestats.UsageStats, error) {
+	s.statsUserID = userID
+	s.statsStart = startTime
+	s.statsEnd = endTime
+	return &usagestats.UsageStats{}, nil
+}
+
 func newUserUsageRequestTypeTestRouter(repo *userUsageRepoCapture) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	usageSvc := service.NewUsageService(repo, nil, nil, nil)
@@ -41,6 +52,7 @@ func newUserUsageRequestTypeTestRouter(repo *userUsageRepoCapture) *gin.Engine {
 		c.Next()
 	})
 	router.GET("/usage", handler.List)
+	router.GET("/usage/stats", handler.Stats)
 	return router
 }
 
@@ -79,4 +91,39 @@ func TestUserUsageListInvalidStream(t *testing.T) {
 	router.ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestUserUsageListLast24HoursPeriod(t *testing.T) {
+	repo := &userUsageRepoCapture{}
+	router := newUserUsageRequestTypeTestRouter(repo)
+
+	before := time.Now().UTC()
+	req := httptest.NewRequest(http.MethodGet, "/usage?period=last24hours&timezone=UTC", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	after := time.Now().UTC()
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, repo.listFilters.StartTime)
+	require.NotNil(t, repo.listFilters.EndTime)
+	require.WithinDuration(t, before.Add(-24*time.Hour), *repo.listFilters.StartTime, 2*time.Second)
+	require.WithinDuration(t, after, *repo.listFilters.EndTime, 2*time.Second)
+	require.Equal(t, 24*time.Hour, repo.listFilters.EndTime.Sub(*repo.listFilters.StartTime))
+}
+
+func TestUserUsageStatsLast24HoursPeriod(t *testing.T) {
+	repo := &userUsageRepoCapture{}
+	router := newUserUsageRequestTypeTestRouter(repo)
+
+	before := time.Now().UTC()
+	req := httptest.NewRequest(http.MethodGet, "/usage/stats?period=last24hours&timezone=UTC", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	after := time.Now().UTC()
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, int64(42), repo.statsUserID)
+	require.WithinDuration(t, before.Add(-24*time.Hour), repo.statsStart, 2*time.Second)
+	require.WithinDuration(t, after, repo.statsEnd, 2*time.Second)
+	require.Equal(t, 24*time.Hour, repo.statsEnd.Sub(repo.statsStart))
 }
