@@ -17,11 +17,18 @@ import (
 
 type userUsageRepoCapture struct {
 	service.UsageLogRepository
-	listParams  pagination.PaginationParams
-	listFilters usagestats.UsageLogFilters
-	statsUserID int64
-	statsStart  time.Time
-	statsEnd    time.Time
+	listParams                pagination.PaginationParams
+	listFilters               usagestats.UsageLogFilters
+	statsUserID               int64
+	statsStart                time.Time
+	statsEnd                  time.Time
+	dashboardTrendUserID      int64
+	dashboardTrendStart       time.Time
+	dashboardTrendEnd         time.Time
+	dashboardTrendGranularity string
+	dashboardModelsUserID     int64
+	dashboardModelsStart      time.Time
+	dashboardModelsEnd        time.Time
 }
 
 func (s *userUsageRepoCapture) ListWithFilters(ctx context.Context, params pagination.PaginationParams, filters usagestats.UsageLogFilters) ([]service.UsageLog, *pagination.PaginationResult, error) {
@@ -42,6 +49,21 @@ func (s *userUsageRepoCapture) GetUserStatsAggregated(ctx context.Context, userI
 	return &usagestats.UsageStats{}, nil
 }
 
+func (s *userUsageRepoCapture) GetUserUsageTrendByUserID(ctx context.Context, userID int64, startTime, endTime time.Time, granularity string) ([]usagestats.TrendDataPoint, error) {
+	s.dashboardTrendUserID = userID
+	s.dashboardTrendStart = startTime
+	s.dashboardTrendEnd = endTime
+	s.dashboardTrendGranularity = granularity
+	return []usagestats.TrendDataPoint{}, nil
+}
+
+func (s *userUsageRepoCapture) GetUserModelStats(ctx context.Context, userID int64, startTime, endTime time.Time) ([]usagestats.ModelStat, error) {
+	s.dashboardModelsUserID = userID
+	s.dashboardModelsStart = startTime
+	s.dashboardModelsEnd = endTime
+	return []usagestats.ModelStat{}, nil
+}
+
 func newUserUsageRequestTypeTestRouter(repo *userUsageRepoCapture) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	usageSvc := service.NewUsageService(repo, nil, nil, nil)
@@ -53,6 +75,8 @@ func newUserUsageRequestTypeTestRouter(repo *userUsageRepoCapture) *gin.Engine {
 	})
 	router.GET("/usage", handler.List)
 	router.GET("/usage/stats", handler.Stats)
+	router.GET("/usage/dashboard/trend", handler.DashboardTrend)
+	router.GET("/usage/dashboard/models", handler.DashboardModels)
 	return router
 }
 
@@ -126,4 +150,38 @@ func TestUserUsageStatsLast24HoursPeriod(t *testing.T) {
 	require.WithinDuration(t, before.Add(-24*time.Hour), repo.statsStart, 2*time.Second)
 	require.WithinDuration(t, after, repo.statsEnd, 2*time.Second)
 	require.Equal(t, 24*time.Hour, repo.statsEnd.Sub(repo.statsStart))
+}
+
+func TestUserDashboardTrendLast24HoursResponseMetadata(t *testing.T) {
+	repo := &userUsageRepoCapture{}
+	router := newUserUsageRequestTypeTestRouter(repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/usage/dashboard/trend?period=24h&timezone=UTC", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, int64(42), repo.dashboardTrendUserID)
+	require.Equal(t, "day", repo.dashboardTrendGranularity)
+	require.Contains(t, rec.Body.String(), "\"period\":\"last24hours\"")
+	require.Contains(t, rec.Body.String(), "\"start_time\"")
+	require.Contains(t, rec.Body.String(), "\"end_time\"")
+}
+
+func TestUserDashboardModelsDateRangeResponseMetadata(t *testing.T) {
+	repo := &userUsageRepoCapture{}
+	router := newUserUsageRequestTypeTestRouter(repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/usage/dashboard/models?start_date=2025-01-01&end_date=2025-01-02&timezone=UTC", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, int64(42), repo.dashboardModelsUserID)
+	require.Equal(t, time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), repo.dashboardModelsStart)
+	require.Equal(t, time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC), repo.dashboardModelsEnd)
+	require.Contains(t, rec.Body.String(), "\"start_date\":\"2025-01-01\"")
+	require.Contains(t, rec.Body.String(), "\"end_date\":\"2025-01-02\"")
+	require.Contains(t, rec.Body.String(), "\"start_time\":\"2025-01-01T00:00:00Z\"")
+	require.Contains(t, rec.Body.String(), "\"end_time\":\"2025-01-03T00:00:00Z\"")
 }

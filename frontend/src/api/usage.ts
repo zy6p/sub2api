@@ -10,7 +10,8 @@ import type {
   UsageStatsResponse,
   PaginatedResponse,
   TrendDataPoint,
-  ModelStat
+  ModelStat,
+  TimeRangeMetadata
 } from '@/types'
 
 // ==================== Dashboard Types ====================
@@ -46,17 +47,13 @@ export interface TrendParams {
   granularity?: 'day' | 'hour'
 }
 
-export interface TrendResponse {
+export interface TrendResponse extends TimeRangeMetadata {
   trend: TrendDataPoint[]
-  start_date: string
-  end_date: string
   granularity: string
 }
 
-export interface ModelStatsResponse {
+export interface ModelStatsResponse extends TimeRangeMetadata {
   models: ModelStat[]
-  start_date: string
-  end_date: string
 }
 
 /**

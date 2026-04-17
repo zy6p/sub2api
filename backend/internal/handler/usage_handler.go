@@ -350,12 +350,10 @@ func (h *UsageHandler) DashboardTrend(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, gin.H{
+	response.Success(c, addTimeRangeResponseMetadata(gin.H{
 		"trend":       trend,
-		"start_date":  startTime.Format("2006-01-02"),
-		"end_date":    endTime.Add(-24 * time.Hour).Format("2006-01-02"),
 		"granularity": granularity,
-	})
+	}, c, startTime, endTime))
 }
 
 // DashboardModels handles getting user model usage statistics
@@ -375,11 +373,9 @@ func (h *UsageHandler) DashboardModels(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, gin.H{
-		"models":     stats,
-		"start_date": startTime.Format("2006-01-02"),
-		"end_date":   endTime.Add(-24 * time.Hour).Format("2006-01-02"),
-	})
+	response.Success(c, addTimeRangeResponseMetadata(gin.H{
+		"models": stats,
+	}, c, startTime, endTime))
 }
 
 // BatchAPIKeysUsageRequest represents the request for batch API keys usage
