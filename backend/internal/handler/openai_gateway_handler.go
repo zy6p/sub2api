@@ -1173,7 +1173,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		sessionHash,
 		reqModel,
 		nil,
-		service.OpenAIUpstreamTransportResponsesWebsocketV2,
+		service.OpenAIUpstreamTransportResponsesWebsocketV2Ingress,
 		false,
 	)
 	if err != nil {
