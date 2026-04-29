@@ -54,7 +54,8 @@ const (
 	openAIWSRetryBackoffMaxDefault     = 2 * time.Second
 	openAIWSRetryJitterRatioDefault    = 0.2
 	openAICompactSessionSeedKey        = "openai_compact_session_seed"
-	codexCLIVersion                    = "0.125.0"
+	defaultOpenAICompactModel          = "gpt-5.4"
+	codexCLIVersion                    = "0.104.0"
 	// Codex 限额快照仅用于后台展示/诊断，不需要每个成功请求都立即落库。
 	openAICodexSnapshotPersistMinInterval = 30 * time.Second
 )
@@ -1960,6 +1961,15 @@ func (s *OpenAIGatewayService) shouldFailoverUpstreamError(statusCode int) bool 
 	}
 }
 
+func ResolveOpenAICompactModel(cfg *config.Config) string {
+	if cfg != nil {
+		if model := strings.TrimSpace(cfg.Gateway.OpenAICompactModel); model != "" {
+			return model
+		}
+	}
+	return defaultOpenAICompactModel
+}
+
 func (s *OpenAIGatewayService) shouldFailoverOpenAIUpstreamResponse(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
 	if s.shouldFailoverUpstreamError(statusCode) {
 		return true
@@ -2099,6 +2109,20 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 	disablePatch := func() {
 		patchDisabled = true
+	}
+
+	compactPath := isOpenAIResponsesCompactPath(c)
+	if compactPath {
+		if changed, compactModel := applyOpenAICompactModelOverride(reqBody, ResolveOpenAICompactModel(s.cfg)); compactModel != "" {
+			if changed {
+				bodyModified = true
+				markPatchSet("model", compactModel)
+				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Compact model override applied: %s -> %s (account: %s)",
+					reqModel, compactModel, account.Name)
+			}
+			reqModel = compactModel
+			originalModel = compactModel
+		}
 	}
 
 	// 非透传模式下，instructions 为空时注入默认指令。
@@ -2619,6 +2643,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 		if err != nil {
+			if shouldFailoverOpenAITransportError(ctx, err) {
+				return nil, s.handleTransportErrorFailover(c, account, err, false)
+			}
 			// Ensure the client receives an error response (handlers assume Forward writes on non-failover errors).
 			safeErr := sanitizeUpstreamErrorMessage(err.Error())
 			setOpsUpstreamError(c, 0, safeErr, "")
@@ -2698,6 +2725,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if reqStream {
 			streamResult, err := s.handleStreamingResponse(ctx, resp, c, account, startTime, originalModel, upstreamModel)
 			if err != nil {
+				if shouldFailoverOpenAIResponseHandlingError(c, err) {
+					return nil, s.handleTransportErrorFailover(c, account, err, false)
+				}
 				return nil, err
 			}
 			usage = streamResult.usage
@@ -2705,6 +2735,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		} else {
 			usage, err = s.handleNonStreamingResponse(ctx, resp, c, account, originalModel, upstreamModel)
 			if err != nil {
+				if shouldFailoverOpenAIResponseHandlingError(c, err) {
+					return nil, s.handleTransportErrorFailover(c, account, err, false)
+				}
 				return nil, err
 			}
 		}
@@ -2748,8 +2781,19 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	reqStream bool,
 	startTime time.Time,
 ) (*OpenAIForwardResult, error) {
+	compactPath := isOpenAIResponsesCompactPath(c)
 	upstreamPassthroughModel := ""
-	if isOpenAIResponsesCompactPath(c) {
+	if compactPath {
+		normalizedBody, normalized, err := normalizeOpenAICompactRequestBody(body, ResolveOpenAICompactModel(s.cfg))
+		if err != nil {
+			return nil, err
+		}
+		if normalized {
+			body = normalizedBody
+			reqModel = strings.TrimSpace(gjson.GetBytes(body, "model").String())
+			reqStream = gjson.GetBytes(body, "stream").Bool()
+			reasoningEffort = extractOpenAIReasoningEffortFromBody(body, reqModel)
+		}
 		compactMappedModel := resolveOpenAICompactForwardModel(account, reqModel)
 		if compactMappedModel != "" && compactMappedModel != reqModel {
 			nextBody, setErr := sjson.SetBytes(body, "model", compactMappedModel)
@@ -2785,7 +2829,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			return nil, fmt.Errorf("openai passthrough rejected before upstream: %s", rejectReason)
 		}
 
-		normalizedBody, normalized, err := normalizeOpenAIPassthroughOAuthBody(body, isOpenAIResponsesCompactPath(c))
+		normalizedBody, normalized, err := normalizeOpenAIPassthroughOAuthBody(body, compactPath)
 		if err != nil {
 			return nil, err
 		}
@@ -2873,6 +2917,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 	if err != nil {
+		if shouldFailoverOpenAITransportError(ctx, err) {
+			return nil, s.handleTransportErrorFailover(c, account, err, true)
+		}
 		safeErr := sanitizeUpstreamErrorMessage(err.Error())
 		setOpsUpstreamError(c, 0, safeErr, "")
 		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
@@ -2908,6 +2955,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	if reqStream {
 		result, err := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
 		if err != nil {
+			if shouldFailoverOpenAIResponseHandlingError(c, err) {
+				return nil, s.handleTransportErrorFailover(c, account, err, true)
+			}
 			return nil, err
 		}
 		usage = result.usage
@@ -2915,6 +2965,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	} else {
 		usage, err = s.handleNonStreamingResponsePassthrough(ctx, resp, c, reqModel, upstreamPassthroughModel)
 		if err != nil {
+			if shouldFailoverOpenAIResponseHandlingError(c, err) {
+				return nil, s.handleTransportErrorFailover(c, account, err, true)
+			}
 			return nil, err
 		}
 	}
@@ -3085,10 +3138,69 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 
 func shouldFailoverOpenAIPassthroughResponse(statusCode int) bool {
 	switch statusCode {
-	case http.StatusTooManyRequests, 529:
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusTooManyRequests, 529:
 		return true
 	default:
 		return false
+	}
+}
+
+func shouldFailoverOpenAITransportError(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrUpstreamResponseBodyTooLarge) {
+		return false
+	}
+	if ctx != nil && errors.Is(ctx.Err(), context.Canceled) {
+		return false
+	}
+	return true
+}
+
+func shouldFailoverOpenAIResponseHandlingError(c *gin.Context, err error) bool {
+	if !isOpenAIResponsesCompactPath(c) {
+		return false
+	}
+	if c != nil && c.Writer != nil && c.Writer.Written() {
+		return false
+	}
+	var ctx context.Context
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	return shouldFailoverOpenAITransportError(ctx, err)
+}
+
+func openAITransportFailoverResponseBody() []byte {
+	return []byte(`{"error":{"type":"upstream_error","message":"Upstream request failed"}}`)
+}
+
+func (s *OpenAIGatewayService) handleTransportErrorFailover(
+	c *gin.Context,
+	account *Account,
+	err error,
+	passthrough bool,
+) error {
+	safeErr := sanitizeUpstreamErrorMessage(err.Error())
+	setOpsUpstreamError(c, 0, safeErr, "")
+
+	event := OpsUpstreamErrorEvent{
+		UpstreamStatusCode: 0,
+		Passthrough:        passthrough,
+		Kind:               "failover",
+		Message:            safeErr,
+	}
+	if account != nil {
+		event.Platform = account.Platform
+		event.AccountID = account.ID
+		event.AccountName = account.Name
+	}
+	appendOpsUpstreamError(c, event)
+
+	return &UpstreamFailoverError{
+		StatusCode:   http.StatusBadGateway,
+		ResponseBody: openAITransportFailoverResponseBody(),
 	}
 }
 
@@ -4915,7 +5027,11 @@ func OpenAICompactSessionSeedKeyForTest() string {
 }
 
 func NormalizeOpenAICompactRequestBodyForTest(body []byte) ([]byte, bool, error) {
-	return normalizeOpenAICompactRequestBody(body)
+	return NormalizeOpenAICompactRequestBody(body, "")
+}
+
+func NormalizeOpenAICompactRequestBody(body []byte, compactModel string) ([]byte, bool, error) {
+	return normalizeOpenAICompactRequestBody(body, compactModel)
 }
 
 func isOpenAIResponsesCompactPath(c *gin.Context) bool {
@@ -4923,11 +5039,12 @@ func isOpenAIResponsesCompactPath(c *gin.Context) bool {
 	return suffix == "/compact" || strings.HasPrefix(suffix, "/compact/")
 }
 
-func normalizeOpenAICompactRequestBody(body []byte) ([]byte, bool, error) {
+func normalizeOpenAICompactRequestBody(body []byte, compactModel string) ([]byte, bool, error) {
 	if len(body) == 0 {
 		return body, false, nil
 	}
 
+	compactModel = strings.TrimSpace(compactModel)
 	normalized := []byte(`{}`)
 	// Keep the current Codex /compact schema while still dropping request-scoped
 	// fields such as prompt_cache_key, store, and stream.
@@ -4945,7 +5062,15 @@ func normalizeOpenAICompactRequestBody(body []byte) ([]byte, bool, error) {
 		if !value.Exists() {
 			continue
 		}
-		next, err := sjson.SetRawBytes(normalized, field, []byte(value.Raw))
+		var (
+			next []byte
+			err  error
+		)
+		if field == "model" && compactModel != "" && value.Type == gjson.String && strings.TrimSpace(value.String()) != "" {
+			next, err = sjson.SetBytes(normalized, field, compactModel)
+		} else {
+			next, err = sjson.SetRawBytes(normalized, field, []byte(value.Raw))
+		}
 		if err != nil {
 			return body, false, fmt.Errorf("normalize compact body %s: %w", field, err)
 		}
@@ -4956,6 +5081,25 @@ func normalizeOpenAICompactRequestBody(body []byte) ([]byte, bool, error) {
 		return body, false, nil
 	}
 	return normalized, true, nil
+}
+
+func applyOpenAICompactModelOverride(reqBody map[string]any, compactModel string) (changed bool, resolvedModel string) {
+	if reqBody == nil {
+		return false, ""
+	}
+	compactModel = strings.TrimSpace(compactModel)
+	if compactModel == "" {
+		return false, ""
+	}
+	rawModel, ok := reqBody["model"].(string)
+	if !ok || strings.TrimSpace(rawModel) == "" {
+		return false, ""
+	}
+	if rawModel == compactModel {
+		return false, compactModel
+	}
+	reqBody["model"] = compactModel
+	return true, compactModel
 }
 
 func resolveOpenAICompactSessionID(c *gin.Context) string {
