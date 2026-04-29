@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -2411,12 +2412,22 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				hooks,
 				wsDecision,
 			)
+		case OpenAIWSIngressModeHTTPBridge:
+			return s.proxyResponsesWebSocketV2HTTPBridge(
+				ctx,
+				c,
+				clientConn,
+				account,
+				token,
+				firstClientMessage,
+				hooks,
+			)
 		case OpenAIWSIngressModeCtxPool, OpenAIWSIngressModeShared, OpenAIWSIngressModeDedicated:
 			// continue
 		default:
 			return NewOpenAIWSClientCloseError(
 				coderws.StatusPolicyViolation,
-				"websocket mode only supports ctx_pool/passthrough",
+				"websocket mode only supports ctx_pool/passthrough/http_bridge",
 				nil,
 			)
 		}
@@ -3582,6 +3593,288 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if !storeDisabled {
 			unpinSessionConn(sessionConnID)
 		}
+		turn++
+	}
+}
+
+func (s *OpenAIGatewayService) proxyResponsesWebSocketV2HTTPBridge(
+	ctx context.Context,
+	c *gin.Context,
+	clientConn *coderws.Conn,
+	account *Account,
+	token string,
+	firstClientMessage []byte,
+	hooks *OpenAIWSIngressHooks,
+) error {
+	if s == nil {
+		return errors.New("service is nil")
+	}
+	if c == nil {
+		return errors.New("gin context is nil")
+	}
+	if clientConn == nil {
+		return errors.New("client websocket is nil")
+	}
+	if account == nil {
+		return errors.New("account is nil")
+	}
+	if strings.TrimSpace(token) == "" {
+		return errors.New("token is empty")
+	}
+
+	isCodexCLI := openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator")) || (s.cfg != nil && s.cfg.Gateway.ForceCodexCLI)
+
+	writeClientMessage := func(message []byte) error {
+		writeCtx, cancel := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
+		defer cancel()
+		return clientConn.Write(writeCtx, coderws.MessageText, message)
+	}
+	readClientMessage := func() ([]byte, error) {
+		msgType, payload, readErr := clientConn.Read(ctx)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
+			return nil, NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				fmt.Sprintf("unsupported websocket client message type: %s", msgType.String()),
+				nil,
+			)
+		}
+		return payload, nil
+	}
+	replaceMappedModel := func(line string, originalModel string) string {
+		if strings.TrimSpace(originalModel) == "" {
+			return line
+		}
+		mappedModel := normalizeOpenAIModelForUpstream(account, account.GetMappedModel(originalModel))
+		if mappedModel == "" || mappedModel == originalModel {
+			return line
+		}
+		return s.replaceModelInSSELine(line, mappedModel, originalModel)
+	}
+
+	turn := 1
+	currentMessage := firstClientMessage
+	for {
+		if hooks != nil && hooks.BeforeTurn != nil {
+			if err := hooks.BeforeTurn(turn); err != nil {
+				return err
+			}
+		}
+
+		trimmed := bytes.TrimSpace(currentMessage)
+		if len(trimmed) == 0 {
+			return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "empty websocket request payload", nil)
+		}
+		if !gjson.ValidBytes(trimmed) {
+			return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", nil)
+		}
+
+		eventType := strings.TrimSpace(gjson.GetBytes(trimmed, "type").String())
+		if eventType == "" {
+			next, setErr := sjson.SetBytes(trimmed, "type", "response.create")
+			if setErr != nil {
+				return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", setErr)
+			}
+			trimmed = next
+			eventType = "response.create"
+		}
+		switch eventType {
+		case "response.create":
+		case "response.append":
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"response.append is not supported in ws v2; use response.create with previous_response_id",
+				nil,
+			)
+		default:
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				fmt.Sprintf("unsupported websocket request type: %s", eventType),
+				nil,
+			)
+		}
+
+		originalModel := strings.TrimSpace(gjson.GetBytes(trimmed, "model").String())
+		if originalModel == "" {
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"model is required in response.create payload",
+				nil,
+			)
+		}
+
+		var reqBody map[string]any
+		if err := json.Unmarshal(trimmed, &reqBody); err != nil {
+			return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", err)
+		}
+		delete(reqBody, "type")
+		// WS ingress 需要事件流语义，桥接到 HTTP 时统一强制 stream=true，
+		// 避免上游返回单体 JSON 导致客户端侧事件流中断。
+		reqBody["stream"] = true
+		body, err := json.Marshal(reqBody)
+		if err != nil {
+			return fmt.Errorf("serialize websocket bridge body: %w", err)
+		}
+
+		promptCacheKey := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
+		upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, true)
+		upstreamReq, err := s.buildUpstreamRequest(upstreamCtx, c, account, body, token, true, promptCacheKey, isCodexCLI)
+		releaseUpstreamCtx()
+		if err != nil {
+			return fmt.Errorf("build upstream request: %w", err)
+		}
+		proxyURL := ""
+		if account.ProxyID != nil && account.Proxy != nil {
+			proxyURL = account.Proxy.URL()
+		}
+
+		upstreamStart := time.Now()
+		resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+		if err != nil {
+			if hooks != nil && hooks.AfterTurn != nil {
+				hooks.AfterTurn(turn, nil, err)
+			}
+			return fmt.Errorf("upstream request failed: %w", err)
+		}
+
+		turnResult := &OpenAIForwardResult{
+			Model:           originalModel,
+			UpstreamModel:   normalizeOpenAIModelForUpstream(account, account.GetMappedModel(originalModel)),
+			Stream:          true,
+			OpenAIWSMode:    true,
+			ResponseHeaders: resp.Header.Clone(),
+		}
+		if turnResult.UpstreamModel == "" {
+			turnResult.UpstreamModel = originalModel
+		}
+
+		firstEventSent := false
+		sawTerminalEvent := false
+		sawDone := false
+		clientDisconnected := false
+		streamErr := error(nil)
+		usage := OpenAIUsage{}
+		responseID := ""
+
+		scanner := bufio.NewScanner(resp.Body)
+		maxLineSize := defaultMaxLineSize
+		if s.cfg != nil && s.cfg.Gateway.MaxLineSize > 0 {
+			maxLineSize = s.cfg.Gateway.MaxLineSize
+		}
+		scanBuf := getSSEScannerBuf64K()
+		scanner.Buffer(scanBuf[:0], maxLineSize)
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			data, ok := extractOpenAISSEDataLine(line)
+			if !ok {
+				continue
+			}
+			if strings.TrimSpace(data) == "" {
+				continue
+			}
+
+			if data == "[DONE]" {
+				sawDone = true
+				continue
+			}
+			if !gjson.Valid(data) {
+				continue
+			}
+
+			eventType := strings.TrimSpace(gjson.Get(data, "type").String())
+			if eventType == "" {
+				continue
+			}
+			if openAIStreamEventIsTerminal(data) {
+				sawTerminalEvent = true
+			}
+			if eventType == "error" {
+				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields([]byte(data))
+				s.persistOpenAIWSRateLimitSignal(ctx, account, resp.Header, []byte(data), errCodeRaw, errTypeRaw, errMsgRaw)
+			}
+			if responseID == "" {
+				responseID = strings.TrimSpace(gjson.Get(data, "response.id").String())
+			}
+			if !firstEventSent && (eventType == "response.output_text.delta" || eventType == "response.completed" || eventType == "response.done" || eventType == "response.failed") {
+				ms := int(time.Since(upstreamStart).Milliseconds())
+				turnResult.FirstTokenMs = &ms
+				firstEventSent = true
+			}
+			s.parseSSEUsageBytes([]byte(data), &usage)
+
+			if clientDisconnected {
+				continue
+			}
+			outLine := "data: " + data
+			outLine = replaceMappedModel(outLine, originalModel)
+			if err := writeClientMessage([]byte(strings.TrimPrefix(outLine, "data: "))); err != nil {
+				if isOpenAIWSClientDisconnectError(err) {
+					clientDisconnected = true
+					continue
+				}
+				streamErr = err
+				break
+			}
+		}
+
+		if closeErr := resp.Body.Close(); closeErr != nil && streamErr == nil {
+			streamErr = closeErr
+		}
+		if scanErr := scanner.Err(); scanErr != nil && streamErr == nil {
+			streamErr = scanErr
+		}
+		putSSEScannerBuf64K(scanBuf)
+
+		if streamErr != nil {
+			if hooks != nil && hooks.AfterTurn != nil {
+				hooks.AfterTurn(turn, nil, streamErr)
+			}
+			if !clientDisconnected {
+				return fmt.Errorf("http bridge stream read error: %w", streamErr)
+			}
+		}
+		if resp.StatusCode >= http.StatusBadRequest {
+			errType := "upstream_error"
+			if resp.StatusCode == http.StatusTooManyRequests {
+				errType = "rate_limit_error"
+			}
+			errMsg := "Upstream request failed"
+			if !clientDisconnected {
+				_ = writeClientMessage([]byte(fmt.Sprintf(`{"type":"error","error":{"type":"%s","message":"%s"}}`, errType, errMsg)))
+			}
+			turnErr := fmt.Errorf("upstream http status: %d", resp.StatusCode)
+			if hooks != nil && hooks.AfterTurn != nil {
+				hooks.AfterTurn(turn, nil, turnErr)
+			}
+			return turnErr
+		}
+
+		if !sawTerminalEvent && !sawDone {
+			turnErr := errors.New("upstream stream ended before terminal event")
+			if hooks != nil && hooks.AfterTurn != nil {
+				hooks.AfterTurn(turn, nil, turnErr)
+			}
+			return turnErr
+		}
+
+		turnResult.RequestID = responseID
+		turnResult.Usage = usage
+		turnResult.Duration = time.Since(upstreamStart)
+		if hooks != nil && hooks.AfterTurn != nil {
+			hooks.AfterTurn(turn, turnResult, nil)
+		}
+
+		nextMessage, readErr := readClientMessage()
+		if readErr != nil {
+			if isOpenAIWSClientDisconnectError(readErr) {
+				return nil
+			}
+			return fmt.Errorf("read client websocket request: %w", readErr)
+		}
+		currentMessage = nextMessage
 		turn++
 	}
 }
