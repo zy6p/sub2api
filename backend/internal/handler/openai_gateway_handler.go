@@ -131,7 +131,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		if compactSeed := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()); compactSeed != "" {
 			c.Set(service.OpenAICompactSessionSeedKeyForTest(), compactSeed)
 		}
-		normalizedCompactBody, normalizedCompact, compactErr := service.NormalizeOpenAICompactRequestBodyForTest(body)
+		normalizedCompactBody, normalizedCompact, compactErr := service.NormalizeOpenAICompactRequestBody(body, service.ResolveOpenAICompactModel(h.cfg))
 		if compactErr != nil {
 			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to normalize compact request body")
 			return
