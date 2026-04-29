@@ -31,18 +31,18 @@ type httpUpstreamRecorder struct {
 	err  error
 }
 
-type errReadCloser struct {
+type oauthErrReadCloser struct {
 	err error
 }
 
-func (r errReadCloser) Read(_ []byte) (int, error) {
+func (r oauthErrReadCloser) Read(_ []byte) (int, error) {
 	if r.err != nil {
 		return 0, r.err
 	}
 	return 0, io.ErrUnexpectedEOF
 }
 
-func (r errReadCloser) Close() error {
+func (r oauthErrReadCloser) Close() error {
 	return nil
 }
 
@@ -388,10 +388,10 @@ func TestOpenAIGatewayService_OAuthPassthrough_UpstreamRequestIgnoresClientCance
 		}, "\n"))),
 	}}
 
-	svc := &OpenAIGatewayService{
-		cfg:          &config.Config{Gateway: config.GatewayConfig{ForceCodexCLI: false}},
-		httpUpstream: upstream,
-	}
+		svc := &OpenAIGatewayService{
+			cfg:          &config.Config{Gateway: config.GatewayConfig{ForceCodexCLI: false}},
+			httpUpstream: upstream,
+		}
 	account := &Account{
 		ID:             123,
 		Name:           "acc",
@@ -892,7 +892,7 @@ func TestOpenAIGatewayService_OpenAIPassthrough_CompactNetworkErrorsTriggerFailo
 			resp: &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid-compact"}},
-				Body:       errReadCloser{err: io.ErrUnexpectedEOF},
+				Body:       oauthErrReadCloser{err: io.ErrUnexpectedEOF},
 			},
 		},
 	}
