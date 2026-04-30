@@ -1786,7 +1786,7 @@ func TestOpenAIResponsesRequestPathSuffix(t *testing.T) {
 func TestNormalizeOpenAICompactRequestBodyPreservesCurrentCodexPayloadFields(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":"compact me"}],"instructions":"compact-test","tools":[{"type":"function","name":"shell"}],"parallel_tool_calls":true,"reasoning":{"effort":"high"},"text":{"verbosity":"low"},"previous_response_id":"resp_123","store":true,"stream":true,"prompt_cache_key":"cache_123"}`)
 
-	normalized, changed, err := normalizeOpenAICompactRequestBody(body)
+	normalized, changed, err := normalizeOpenAICompactRequestBody(body, "")
 
 	require.NoError(t, err)
 	require.True(t, changed)
