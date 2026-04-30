@@ -30,6 +30,22 @@ type stubOpenAIAccountRepo struct {
 	accounts []Account
 }
 
+type openAICompactProtocolErrorRepo struct {
+	stubOpenAIAccountRepo
+	rateLimitCalls []time.Time
+	errorCalls     []string
+}
+
+func (r *openAICompactProtocolErrorRepo) SetRateLimited(_ context.Context, _ int64, resetAt time.Time) error {
+	r.rateLimitCalls = append(r.rateLimitCalls, resetAt)
+	return nil
+}
+
+func (r *openAICompactProtocolErrorRepo) SetError(_ context.Context, _ int64, errorMsg string) error {
+	r.errorCalls = append(r.errorCalls, errorMsg)
+	return nil
+}
+
 type snapshotUpdateAccountRepo struct {
 	stubOpenAIAccountRepo
 	updateExtraCalls chan map[string]any
@@ -1784,7 +1800,6 @@ func TestNormalizeOpenAICompactRequestBodyPreservesCurrentCodexPayloadFields(t *
 	require.False(t, gjson.GetBytes(normalized, "stream").Exists())
 	require.False(t, gjson.GetBytes(normalized, "prompt_cache_key").Exists())
 }
-
 func TestOpenAIBuildUpstreamRequestOpenAIPassthroughPreservesCompactPath(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
@@ -2269,4 +2284,59 @@ func TestHandleSSEToJSON_ResponseFailedReturnsProtocolError(t *testing.T) {
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 	require.Contains(t, rec.Body.String(), "upstream rejected request")
 	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
+}
+
+func TestOpenAIGatewayService_CompactResponseFailedUsageLimit_MarksRateLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(nil))
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.1.0")
+
+	upstreamSSE := strings.Join([]string{
+		"data: {\"type\":\"response.failed\",\"error\":{\"type\":\"usage_limit_reached\",\"code\":\"rate_limit_exceeded\",\"message\":\"The usage limit has been reached\",\"resets_in_seconds\":3600}}",
+		"data: [DONE]",
+	}, "\n")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type": []string{"text/event-stream"},
+			"x-request-id": []string{"rid-compact-limit"},
+		},
+		Body: io.NopCloser(strings.NewReader(upstreamSSE)),
+	}}
+
+	repo := &openAICompactProtocolErrorRepo{}
+	rateSvc := NewRateLimitService(repo, nil, &config.Config{
+		RateLimit: config.RateLimitConfig{OverloadCooldownMinutes: 10},
+	}, nil, nil)
+
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{Gateway: config.GatewayConfig{ForceCodexCLI: false}},
+		httpUpstream:     upstream,
+		rateLimitService: rateSvc,
+	}
+
+	account := &Account{
+		ID:          123,
+		Name:        "acc",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
+		Extra:       map[string]any{"openai_passthrough": true},
+		Status:      StatusActive,
+		Schedulable: true,
+		RateMultiplier: f64p(1),
+	}
+
+	body := []byte(`{"model":"gpt-5.5","instructions":"compact me","input":[{"type":"text","text":"hi"}]}`)
+	_, err := svc.Forward(context.Background(), c, account, body)
+	require.Error(t, err)
+
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	require.Len(t, repo.rateLimitCalls, 1)
+	require.Empty(t, repo.errorCalls)
 }
