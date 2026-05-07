@@ -3128,6 +3128,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	currentTurnReplayInput := []json.RawMessage(nil)
 	currentTurnReplayInputExists := false
 	skipBeforeTurn := false
+	skipNextPreflightPing := false
+	allowStrictAffinityConnDriftOnce := false
 	resetSessionLease := func(markBroken bool) {
 		if sessionLease == nil {
 			return
@@ -3395,6 +3397,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 		}
 		forcePreferredConn := isStrictAffinityTurn(currentPayload)
+		if forcePreferredConn && allowStrictAffinityConnDriftOnce {
+			logOpenAIWSModeInfo(
+				"ingress_ws_strict_affinity_recovery account_id=%d turn=%d action=allow_new_connection previous_response_id=%s reason=function_call_output_preflight_ping_fail",
+				account.ID,
+				turn,
+				truncateOpenAIWSLogValue(currentPreviousResponseID, openAIWSIDValueMaxLen),
+			)
+			forcePreferredConn = false
+			allowStrictAffinityConnDriftOnce = false
+		}
 		if sessionLease == nil {
 			acquiredLease, acquireErr := acquireTurnLease(turn, preferredConnID, forcePreferredConn)
 			if acquireErr != nil {
@@ -3409,6 +3421,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 		}
 		shouldPreflightPing := turn > 1 && sessionLease != nil && turnRetry == 0
+		if shouldPreflightPing && skipNextPreflightPing {
+			shouldPreflightPing = false
+			skipNextPreflightPing = false
+		}
 		if shouldPreflightPing && openAIWSIngressPreflightPingIdle > 0 && !lastTurnFinishedAt.IsZero() {
 			if time.Since(lastTurnFinishedAt) < openAIWSIngressPreflightPingIdle {
 				shouldPreflightPing = false
@@ -3424,11 +3440,22 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					truncateOpenAIWSLogValue(pingErr.Error(), openAIWSLogValueMaxLen),
 				)
 				if forcePreferredConn {
-					// 携带 function_call_output 的请求不能丢弃 previous_response_id：
-					// 上游 API 需要 response chain 来匹配 tool_result 与之前的 tool_use，
-					// 丢弃后会导致 "No tool call found for function call output" 400 错误。
-					hasFCOutput := gjson.GetBytes(currentPayload, `input.#(type=="function_call_output")`).Exists()
-					if !turnPrevRecoveryTried && currentPreviousResponseID != "" && !hasFCOutput {
+					if !turnPrevRecoveryTried && currentPreviousResponseID != "" {
+						if hasFunctionCallOutput {
+							logOpenAIWSModeInfo(
+								"ingress_ws_preflight_ping_recovery account_id=%d turn=%d conn_id=%s action=keep_previous_response_id_retry previous_response_id=%s reason=has_function_call_output",
+								account.ID,
+								turn,
+								truncateOpenAIWSLogValue(sessionConnID, openAIWSIDValueMaxLen),
+								truncateOpenAIWSLogValue(currentPreviousResponseID, openAIWSIDValueMaxLen),
+							)
+							turnPrevRecoveryTried = true
+							allowStrictAffinityConnDriftOnce = true
+							skipNextPreflightPing = true
+							resetSessionLease(true)
+							skipBeforeTurn = true
+							continue
+						}
 						updatedPayload, removed, dropErr := dropPreviousResponseIDFromRawPayload(currentPayload)
 						if dropErr != nil || !removed {
 							reason := "not_removed"
