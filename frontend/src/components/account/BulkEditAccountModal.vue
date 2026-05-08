@@ -1151,7 +1151,7 @@ const allOpenAIPassthroughCapable = computed(() => {
     targetSelectedPlatforms.value.length === 1 &&
     targetSelectedPlatforms.value[0] === 'openai' &&
     targetSelectedTypes.value.length > 0 &&
-    targetSelectedTypes.value.every(t => t === 'oauth' || t === 'apikey')
+    targetSelectedTypes.value.every(t => t === 'oauth' || t === 'setup-token' || t === 'apikey')
   )
 })
 
@@ -1160,7 +1160,7 @@ const allOpenAIOAuth = computed(() => {
     targetSelectedPlatforms.value.length === 1 &&
     targetSelectedPlatforms.value[0] === 'openai' &&
     targetSelectedTypes.value.length > 0 &&
-    targetSelectedTypes.value.every(t => t === 'oauth')
+    targetSelectedTypes.value.every(t => t === 'oauth' || t === 'setup-token')
   )
 })
 
