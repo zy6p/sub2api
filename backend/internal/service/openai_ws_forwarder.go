@@ -3520,7 +3520,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 							}
 						}
 					}
-					if hasFCOutput && currentPreviousResponseID != "" {
+					if hasFunctionCallOutput && currentPreviousResponseID != "" {
 						logOpenAIWSModeInfo(
 							"ingress_ws_preflight_ping_recovery_skip account_id=%d turn=%d conn_id=%s reason=function_call_output action=fail_close previous_response_id=%s",
 							account.ID,
