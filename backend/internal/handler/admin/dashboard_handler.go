@@ -41,6 +41,12 @@ func parseTimeRange(c *gin.Context) (time.Time, time.Time) {
 
 	var startTime, endTime time.Time
 
+	if startDate == "" && endDate == "" && timezone.IsLast24HoursPeriod(c.Query("period")) {
+		startTime = now.Add(-24 * time.Hour)
+		endTime = now
+		return startTime, endTime
+	}
+
 	if startDate != "" {
 		if t, err := timezone.ParseInUserLocation("2006-01-02", startDate, userTZ); err == nil {
 			startTime = t

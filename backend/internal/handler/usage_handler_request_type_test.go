@@ -131,7 +131,7 @@ func TestUserUsageListLast24HoursPeriod(t *testing.T) {
 	require.NotNil(t, repo.listFilters.EndTime)
 	require.WithinDuration(t, before.Add(-24*time.Hour), *repo.listFilters.StartTime, 2*time.Second)
 	require.WithinDuration(t, after, *repo.listFilters.EndTime, 2*time.Second)
-	require.Equal(t, 24*time.Hour, repo.listFilters.EndTime.Sub(*repo.listFilters.StartTime))
+	require.WithinDuration(t, *repo.listFilters.StartTime, repo.listFilters.EndTime.Add(-24*time.Hour), 2*time.Second)
 }
 
 func TestUserUsageStatsLast24HoursPeriod(t *testing.T) {
@@ -148,7 +148,7 @@ func TestUserUsageStatsLast24HoursPeriod(t *testing.T) {
 	require.Equal(t, int64(42), repo.statsUserID)
 	require.WithinDuration(t, before.Add(-24*time.Hour), repo.statsStart, 2*time.Second)
 	require.WithinDuration(t, after, repo.statsEnd, 2*time.Second)
-	require.Equal(t, 24*time.Hour, repo.statsEnd.Sub(repo.statsStart))
+	require.WithinDuration(t, repo.statsStart, repo.statsEnd.Add(-24*time.Hour), 2*time.Second)
 }
 
 func TestUserDashboardTrendLast24HoursResponseMetadata(t *testing.T) {

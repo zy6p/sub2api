@@ -6,6 +6,7 @@ package timezone
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -158,4 +159,14 @@ func StartOfDayInUserLocation(t time.Time, userTZ string) time.Time {
 	}
 	t = t.In(loc)
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
+}
+
+// IsLast24HoursPeriod reports whether the period query is the 24h window alias.
+func IsLast24HoursPeriod(period string) bool {
+	switch strings.ToLower(strings.TrimSpace(period)) {
+	case "24h", "last24hours":
+		return true
+	default:
+		return false
+	}
 }

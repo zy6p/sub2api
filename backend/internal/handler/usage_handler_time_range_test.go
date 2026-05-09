@@ -29,7 +29,7 @@ func TestUserTimeRangeResponseMetadataLast24Hours(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodGet, "/?period=24h&timezone=UTC", nil)
+	c.Request = httptest.NewRequest(http.MethodGet, "/?period=last24hours&timezone=UTC", nil)
 
 	before := time.Now().UTC()
 	start, end := parseUserTimeRange(c)
