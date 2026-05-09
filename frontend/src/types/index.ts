@@ -1552,6 +1552,7 @@ export interface UsageQueryParams {
   request_type?: UsageRequestType
   stream?: boolean
   billing_type?: number | null
+  period?: string
   start_date?: string
   end_date?: string
   sort_by?: string
