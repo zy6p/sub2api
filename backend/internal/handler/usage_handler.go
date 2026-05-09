@@ -99,24 +99,33 @@ func (h *UsageHandler) List(c *gin.Context) {
 	// Parse date range
 	var startTime, endTime *time.Time
 	userTZ := c.Query("timezone") // Get user's timezone from request
-	if startDateStr := c.Query("start_date"); startDateStr != "" {
-		t, err := timezone.ParseInUserLocation("2006-01-02", startDateStr, userTZ)
-		if err != nil {
-			response.BadRequest(c, "Invalid start_date format, use YYYY-MM-DD")
-			return
+	startDateStr := c.Query("start_date")
+	endDateStr := c.Query("end_date")
+	if startDateStr == "" && endDateStr == "" && timezone.IsLast24HoursPeriod(c.Query("period")) {
+		start := timezone.NowInUserLocation(userTZ).Add(-24 * time.Hour)
+		end := timezone.NowInUserLocation(userTZ)
+		startTime = &start
+		endTime = &end
+	} else {
+		if startDateStr != "" {
+			t, err := timezone.ParseInUserLocation("2006-01-02", startDateStr, userTZ)
+			if err != nil {
+				response.BadRequest(c, "Invalid start_date format, use YYYY-MM-DD")
+				return
+			}
+			startTime = &t
 		}
-		startTime = &t
-	}
 
-	if endDateStr := c.Query("end_date"); endDateStr != "" {
-		t, err := timezone.ParseInUserLocation("2006-01-02", endDateStr, userTZ)
-		if err != nil {
-			response.BadRequest(c, "Invalid end_date format, use YYYY-MM-DD")
-			return
+		if endDateStr != "" {
+			t, err := timezone.ParseInUserLocation("2006-01-02", endDateStr, userTZ)
+			if err != nil {
+				response.BadRequest(c, "Invalid end_date format, use YYYY-MM-DD")
+				return
+			}
+			// Use half-open range [start, end), move to next calendar day start (DST-safe).
+			t = t.AddDate(0, 0, 1)
+			endTime = &t
 		}
-		// Use half-open range [start, end), move to next calendar day start (DST-safe).
-		t = t.AddDate(0, 0, 1)
-		endTime = &t
 	}
 
 	params := pagination.PaginationParams{
@@ -215,11 +224,13 @@ func (h *UsageHandler) Stats(c *gin.Context) {
 	now := timezone.NowInUserLocation(userTZ)
 	var startTime, endTime time.Time
 
-	// 优先使用 start_date 和 end_date 参数
+	// 优先使用 start_date 和 end_date 参数，其次支持 last24hours/24h
 	startDateStr := c.Query("start_date")
 	endDateStr := c.Query("end_date")
-
-	if startDateStr != "" && endDateStr != "" {
+	if startDateStr == "" && endDateStr == "" && timezone.IsLast24HoursPeriod(c.Query("period")) {
+		startTime = now.Add(-24 * time.Hour)
+		endTime = now
+	} else if startDateStr != "" && endDateStr != "" {
 		// 使用自定义日期范围
 		var err error
 		startTime, err = timezone.ParseInUserLocation("2006-01-02", startDateStr, userTZ)
@@ -274,6 +285,12 @@ func parseUserTimeRange(c *gin.Context) (time.Time, time.Time) {
 	endDate := c.Query("end_date")
 
 	var startTime, endTime time.Time
+
+	if startDate == "" && endDate == "" && timezone.IsLast24HoursPeriod(c.Query("period")) {
+		startTime = now.Add(-24 * time.Hour)
+		endTime = now
+		return startTime, endTime
+	}
 
 	if startDate != "" {
 		if t, err := timezone.ParseInUserLocation("2006-01-02", startDate, userTZ); err == nil {
