@@ -27,6 +27,11 @@ type UsageHandler struct {
 	cleanupService *service.UsageCleanupService
 }
 
+func isLast24HoursPeriod(period string) bool {
+	p := strings.TrimSpace(strings.ToLower(period))
+	return p == "24h" || p == "last24hours"
+}
+
 // NewUsageHandler creates a new admin usage handler
 func NewUsageHandler(
 	usageService *service.UsageService,
@@ -164,7 +169,7 @@ func (h *UsageHandler) List(c *gin.Context) {
 		t = t.AddDate(0, 0, 1)
 		endTime = &t
 	}
-	if startTime == nil && endTime == nil && timezone.IsLast24HoursPeriod(c.Query("period")) {
+	if startTime == nil && endTime == nil && isLast24HoursPeriod(c.Query("period")) {
 		now := timezone.NowInUserLocation(userTZ)
 		start := now.Add(-24 * time.Hour)
 		end := now
@@ -304,8 +309,8 @@ func (h *UsageHandler) Stats(c *gin.Context) {
 		endTime = endTime.AddDate(0, 0, 1)
 	} else {
 		period := c.DefaultQuery("period", "today")
-		switch {
-		case timezone.IsLast24HoursPeriod(period):
+			switch {
+			case isLast24HoursPeriod(period):
 			startTime = now.Add(-24 * time.Hour)
 		default:
 			switch period {
